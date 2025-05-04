@@ -1,0 +1,15 @@
+#!/bin/bash
+# Stop MPVPN2 services
+
+BASE_PATH="/opt/mpvpn2"
+source "${BASE_PATH}/etc/globals.conf"
+source "${BASE_PATH}/lib/vpn.sh"
+
+LOG_FILE="${BASE_PATH}/logs/mpvpn-stop-$(date +%Y%m%d).log"
+exec >> "$LOG_FILE" 2>&1
+
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Stopping MPVPN2 services"
+
+stop_vpn_connections
+
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] MPVPN2 services stopped"

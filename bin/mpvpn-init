@@ -1,0 +1,34 @@
+#!/bin/bash
+# Initialize MPVPN2 routing and firewall rules
+
+BASE_PATH="/opt/mpvpn2"
+source "${BASE_PATH}/etc/globals.conf"
+source "${BASE_PATH}/lib/routing.sh"
+source "${BASE_PATH}/lib/firewall.sh"
+source "${BASE_PATH}/lib/vpn.sh"
+
+# Ensure log directory exists
+mkdir -p "${BASE_PATH}/logs"
+
+# Initialize logging
+LOG_FILE="${BASE_PATH}/logs/mpvpn-init-$(date +%Y%m%d).log"
+exec >> "$LOG_FILE" 2>&1
+
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Initializing MPVPN2"
+
+# Load required kernel modules
+modprobe ip_tables
+modprobe ip_set
+modprobe xt_set
+modprobe xt_mark
+
+# Initialize routing tables
+init_routing_tables
+
+# Setup firewall rules
+setup_firewall
+
+# Initialize VPN connections
+init_vpn_connections
+
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] MPVPN2 initialization complete"

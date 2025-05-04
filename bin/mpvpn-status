@@ -1,0 +1,28 @@
+#!/bin/bash
+# Show MPVPN2 status
+
+BASE_PATH="/opt/mpvpn2"
+source "${BASE_PATH}/etc/globals.conf"
+
+echo "=== MPVPN2 Status ==="
+echo "Last updated: $(date)"
+echo
+
+echo "=== VPN Connections ==="
+for vpn in "${WGVPN_LIST[@]}"; do
+    status=$(wg show "$vpn" 2>/dev/null | grep -q "interface" && echo "UP" || echo "DOWN")
+    echo "WireGuard $vpn: $status"
+done
+
+if [[ "$ENABLE_OVPN" == "true" ]]; then
+    for vpn in "${OVPN_LIST[@]}"; do
+        status=$(systemctl is-active "openvpn@${vpn}")
+        echo "OpenVPN $vpn: $status"
+    done
+fi
+
+echo
+echo "=== Routing Tables ==="
+ip rule show
+echo
+ip route show table all
