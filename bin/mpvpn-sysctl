@@ -1,0 +1,137 @@
+#!/bin/bash
+# MPVPN2 Kernel Tuning Script
+# Integriert mit dem MPVPN2-Projekt
+
+BASE_PATH="/opt/mpvpn2"
+source "${BASE_PATH}/etc/globals.conf"
+
+SYSCTL_FILE="/etc/sysctl.d/99-mpvpn-tuning.conf"
+LOG_FILE="${BASE_PATH}/logs/sysctl-$(date +%Y%m%d).log"
+
+exec > >(tee -a "$LOG_FILE") 2>&1
+
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Starting MPVPN2 Kernel Tuning"
+
+# Backup existing configuration
+backup_config() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Creating backup of existing sysctl settings"
+    mkdir -p "${BASE_PATH}/backups"
+    sysctl -a > "${BASE_PATH}/backups/sysctl_backup_$(date +%Y%m%d-%H%M%S).conf"
+}
+
+# Apply settings
+apply_settings() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Generating sysctl configuration"
+
+    cat > "$SYSCTL_FILE" <<-EOF
+# ===== MPVPN2 Kernel Settings =====
+# Applied: $(date)
+
+# Basic Networking
+net.ipv4.ip_forward = 1
+net.ipv6.conf.all.forwarding = 0
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+net.ipv6.conf.lo.disable_ipv6 = 1
+
+# Strict ECMP/Round-Robin
+net.ipv4.fib_multipath_hash_policy = 1
+net.ipv4.fib_multipath_use_neigh = 1
+net.ipv4.fib_multipath_hash_fields = 0x0037
+net.ipv4.conf.all.arp_ignore = 1
+net.ipv4.conf.all.arp_announce = 2
+net.ipv4.conf.all.rp_filter = 2
+net.ipv4.conf.default.rp_filter = 2
+
+# VPN Performance
+net.ipv4.tcp_reordering = 10
+net.ipv4.tcp_mtu_probing = 2
+net.ipv4.tcp_slow_start_after_idle = 0
+net.ipv4.tcp_no_metrics_save = 1
+net.ipv4.tcp_ecn = 0
+EOF
+
+    # WireGuard specific optimizations if WireGuard is used
+    if [[ ${#WGVPN_LIST[@]} -gt 0 ]]; then
+        cat >> "$SYSCTL_FILE" <<-EOF
+
+# WireGuard Optimizations
+net.core.rmem_default = 4194304
+net.core.wmem_default = 4194304
+net.ipv4.udp_rmem_min = 131072
+net.ipv4.udp_wmem_min = 131072
+EOF
+    fi
+
+    cat >> "$SYSCTL_FILE" <<-EOF
+
+# Buffer Settings
+net.core.rmem_max = 16777216
+net.core.wmem_max = 16777216
+net.ipv4.tcp_rmem = 4096 87380 4194304
+net.ipv4.tcp_wmem = 4096 65536 4194304
+net.ipv4.tcp_window_scaling = 1
+
+# Advanced Networking
+net.core.default_qdisc = fq_codel
+net.ipv4.tcp_congestion_control = bbr
+net.ipv4.tcp_max_syn_backlog = 8192
+net.ipv4.tcp_synack_retries = 3
+
+# Conntrack Settings
+net.netfilter.nf_conntrack_max = 524288
+net.netfilter.nf_conntrack_buckets = 131072
+net.netfilter.nf_conntrack_helper = 0
+net.netfilter.nf_conntrack_acct = 1
+net.netfilter.nf_conntrack_tcp_timeout_established = 86400
+net.netfilter.nf_conntrack_tcp_timeout_close = 10
+net.netfilter.nf_conntrack_tcp_timeout_close_wait = 60
+net.netfilter.nf_conntrack_tcp_timeout_fin_wait = 120
+net.netfilter.nf_conntrack_tcp_timeout_last_ack = 30
+net.netfilter.nf_conntrack_tcp_timeout_syn_recv = 60
+net.netfilter.nf_conntrack_tcp_timeout_syn_sent = 120
+net.netfilter.nf_conntrack_tcp_timeout_time_wait = 120
+net.netfilter.nf_conntrack_udp_timeout = 60
+net.netfilter.nf_conntrack_udp_timeout_stream = 180
+net.netfilter.nf_conntrack_icmp_timeout = 30
+net.netfilter.nf_conntrack_generic_timeout = 600
+
+# System Performance
+fs.file-max = 2097152
+net.core.netdev_max_backlog = 300000
+net.core.somaxconn = 32768
+net.ipv4.xfrm4_gc_thresh = 32768
+EOF
+}
+
+verify_settings() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] Verifying applied settings"
+    
+    declare -A EXPECTED_SETTINGS=(
+        ["net.ipv4.fib_multipath_hash_policy"]="1"
+        ["net.ipv4.tcp_mtu_probing"]="2"
+        ["net.core.default_qdisc"]="fq_codel"
+        ["net.ipv4.tcp_congestion_control"]="bbr"
+    )
+    
+    for setting in "${!EXPECTED_SETTINGS[@]}"; do
+        local current_value=$(sysctl -n "$setting" 2>/dev/null)
+        if [[ "$current_value" != "${EXPECTED_SETTINGS[$setting]}" ]]; then
+            echo "[WARNING] $setting is $current_value (expected ${EXPECTED_SETTINGS[$setting]})"
+        fi
+    done
+}
+
+# Main execution
+backup_config
+apply_settings
+
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Loading new sysctl settings"
+if ! sysctl --system; then
+    echo "[ERROR] Failed to apply sysctl settings!" >&2
+    exit 1
+fi
+
+verify_settings
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Kernel tuning completed successfully"
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] Details logged to $LOG_FILE"
