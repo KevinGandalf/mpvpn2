@@ -1,0 +1,143 @@
+#!/bin/bash
+# MPVPN2 Mailserver Routing Script
+# Version 2.0 - Vollständig integriert mit MPVPN2-Architektur
+
+BASE_PATH="/opt/mpvpn2"
+source "${BASE_PATH}/etc/globals.conf"
+
+# === Verzeichnisstruktur ===
+LOG_DIR="${BASE_PATH}/logs/mailserver"
+mkdir -p "$LOG_DIR"
+LOGFILE="${LOG_DIR}/mailserver-$(date +%Y%m%d).log"
+STATUS_FILE="${LOG_DIR}/status-$(date +%Y%m%d).log"
+
+# === Initialisierung ===
+init_mail_routing() {
+    # Finde smtp-Tabelle
+    MARK=""
+    TABLE=""
+    for entry in "${EXTRA_RT_TABLES[@]}"; do
+        IFS=' ' read -r rt_id rt_name <<< "$entry"
+        if [[ "$rt_name" == "smtp" ]]; then
+            MARK=$rt_id
+            TABLE=$rt_name
+            break
+        fi
+    done
+
+    if [[ -z "$MARK" || -z "$TABLE" ]]; then
+        log "ERROR: 'smtp' table not found in EXTRA_RT_TABLES"
+        exit 1
+    fi
+
+    # Sicherstellen dass Tabelle existiert
+    if ! grep -qE "^$MARK[[:space:]]+$TABLE" /etc/iproute2/rt_tables; then
+        echo "$MARK $TABLE" >> /etc/iproute2/rt_tables
+        log "Added table $MARK ($TABLE) to /etc/iproute2/rt_tables"
+    fi
+
+    # Tabelle leeren
+    if ip route show table "$TABLE" &>/dev/null; then
+        ip route flush table "$TABLE"
+        log "Flushed existing routing table $TABLE"
+    fi
+
+    # Standardroute setzen
+    ip route add default via "$DEFAULT_WANGW" dev "$DEFAULT_LANIF" table "$TABLE"
+    ip rule add fwmark "$MARK" table "$TABLE" 2>/dev/null || log "Rule already exists"
+}
+
+# === Logging ===
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOGFILE"
+}
+
+# === DNS-Auflösung ===
+resolve_mx_records() {
+    local domain=$1
+    declare -gA mail_servers
+
+    # MX-Records auflösen
+    mx_hosts=$(dig +short MX "$domain" | sort -n | awk '{print $2}')
+    
+    for host in $mx_hosts; do
+        # A-Records der MX-Hosts auflösen
+        ips=$(dig +short A "$host" | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$')
+        for ip in $ips; do
+            mail_servers["$ip"]=1
+        done
+    done
+}
+
+# === Hauptfunktion ===
+update_mail_routing() {
+    log "==== Starting Mailserver Routing Update ===="
+    init_mail_routing
+
+    declare -A added_ips
+    local total_servers=${#MAIL_SERVERS[@]}
+    local current=0
+
+    log "Configuring routing for $total_servers mail domains"
+
+    for domain in "${MAIL_SERVERS[@]}"; do
+        ((current++))
+        log "Processing $domain ($current/$total_servers)"
+
+        declare -A mail_servers
+        resolve_mx_records "$domain"
+
+        if [[ ${#mail_servers[@]} -eq 0 ]]; then
+            log "No MX records found for $domain"
+            continue
+        fi
+
+        for ip in "${!mail_servers[@]}"; do
+            if [[ -z "${added_ips[$ip]}" ]]; then
+                # Route hinzufügen
+                if ! ip route show table "$TABLE" | grep -q "$ip"; then
+                    ip route add "$ip" via "$DEFAULT_WANGW" dev "$DEFAULT_LANIF" table "$TABLE" && \
+                        log "Added route for $ip to table $TABLE"
+                fi
+
+                # iptables Regel
+                if ! iptables -t mangle -C PREROUTING -d "$ip" -j MARK --set-mark "$MARK" 2>/dev/null; then
+                    iptables -t mangle -A PREROUTING -d "$ip" -j MARK --set-mark "$MARK" && \
+                        log "Added iptables rule for $ip (mark $MARK)"
+                fi
+
+                added_ips["$ip"]=1
+            fi
+        done
+    done
+
+    # SMTP-Ports Routing
+    for port in 25 465 587; do
+        if ! ip rule show | grep -q "ipproto tcp dport $port"; then
+            ip rule add ipproto tcp dport "$port" table "$TABLE" && \
+                log "Added rule for TCP port $port to table $TABLE"
+        fi
+    done
+
+    # Statusbericht
+    {
+        echo "=== MPVPN2 Mailserver Routing Status ==="
+        echo "Last Update: $(date)"
+        echo "Routing Table: $MARK ($TABLE)"
+        echo "Gateway: $DEFAULT_WANGW"
+        echo "Interface: $DEFAULT_LANIF"
+        echo "Processed Domains: $total_servers"
+        echo "Unique Mailserver IPs: ${#added_ips[@]}"
+        echo ""
+        echo "=== Mailserver Domains ==="
+        printf '%s\n' "${MAIL_SERVERS[@]}"
+        echo ""
+        echo "=== Routed Mailserver IPs ==="
+        printf '%s\n' "${!added_ips[@]}" | sort
+    } > "$STATUS_FILE"
+
+    log "Successfully updated mail routing for ${#added_ips[@]} unique IPs"
+}
+
+# === Ausführung ===
+update_mail_routing

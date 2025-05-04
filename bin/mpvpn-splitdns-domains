@@ -1,0 +1,177 @@
+#!/bin/bash
+# MPVPN2 Split-DNS Routing Script
+# Version 2.0 - Vollständig integriert mit MPVPN2-Architektur
+
+BASE_PATH="/opt/mpvpn2"
+source "${BASE_PATH}/etc/globals.conf"
+
+# === Verzeichnisstruktur ===
+LOG_DIR="${BASE_PATH}/logs/splitdns"
+mkdir -p "$LOG_DIR"
+LOGFILE="${LOG_DIR}/domains-$(date +%Y%m%d).log"
+STATUS_FILE="${LOG_DIR}/status-$(date +%Y%m%d).log"
+
+# === DNS-Resolver Konfiguration ===
+declare -A DNS_SERVERS=(
+    ["cloudflare"]="1.1.1.1"
+    ["google"]="8.8.8.8"
+    ["quad9"]="9.9.9.9"
+    ["opendns"]="208.67.222.222"
+    ["nordvpn1"]="103.86.96.100"
+    ["nordvpn2"]="103.86.99.100"
+)
+
+# === Initialisierung ===
+init_routing() {
+    # Finde clear-Tabelle
+    MARK=""
+    for entry in "${EXTRA_RT_TABLES[@]}"; do
+        IFS=' ' read -r rt_id rt_name <<< "$entry"
+        if [[ "$rt_name" == "clear" ]]; then
+            MARK=$rt_id
+            break
+        fi
+    done
+
+    if [[ -z "$MARK" ]]; then
+        log "ERROR: 'clear' table not found in EXTRA_RT_TABLES"
+        exit 1
+    fi
+
+    # Sicherstellen dass Tabelle existiert
+    if ! grep -qE "^$MARK[[:space:]]+clear" /etc/iproute2/rt_tables; then
+        echo "$MARK clear" >> /etc/iproute2/rt_tables
+        log "Added table $MARK (clear) to /etc/iproute2/rt_tables"
+    fi
+
+    # Tabelle leeren
+    if ip route show table "$MARK" &>/dev/null; then
+        ip route flush table "$MARK"
+        log "Flushed existing routing table $MARK"
+    fi
+
+    # Standardroute setzen
+    ip route add default via "$DEFAULT_WANGW" dev "$DEFAULT_LANIF" table "$MARK"
+}
+
+# === Logging ===
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOGFILE"
+}
+
+# === Fortschrittsanzeige ===
+show_progress() {
+    local total=$1
+    local current=$2
+    local domain=$3
+    local width=50
+    local progress=$(( (current * width) / total ))
+    local percent=$(( (current * 100) / total ))
+
+    printf "\r[%-${width}s] %d%% | %s" \
+        "$(printf '#%.0s' $(seq 1 $progress))" \
+        "$percent" \
+        "$domain"
+}
+
+# === DNS-Auflösung ===
+resolve_domain() {
+    local domain=$1
+    declare -gA resolved_ips
+    declare -A unique_ips
+
+    for dns in "${DNS_SERVERS[@]}"; do
+        while IFS= read -r ip; do
+            [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
+            unique_ips["$ip"]=1
+        done < <(dig +short A "$domain" @"$dns" 2>/dev/null)
+    done
+
+    resolved_ips=()
+    for ip in "${!unique_ips[@]}"; do
+        resolved_ips["$ip"]=1
+    done
+}
+
+# === VPN-Provider Blocklist ===
+check_blocklist() {
+    local ip=$1
+    # Liste bekannter VPN-Provider IPs
+    local vpn_providers=(
+        "nordvpn.com" "expressvpn.com" "surfshark.com"
+        "privateinternetaccess.com" "protonvpn.com"
+    )
+
+    for provider in "${vpn_providers[@]}"; do
+        for dns in "${DNS_SERVERS[@]}"; do
+            if dig +short A "$provider" @"$dns" | grep -q "$ip"; then
+                return 0 # Gefunden in Blocklist
+            fi
+        done
+    done
+
+    return 1 # Nicht blockiert
+}
+
+# === Hauptfunktion ===
+update_routing() {
+    log "==== Starting Routing Update ===="
+    init_routing
+
+    declare -A added_ips
+    local total_domains=${#CLEARDOMAINS[@]}
+    local current=0
+
+    for domain in "${CLEARDOMAINS[@]}"; do
+        ((current++))
+        show_progress "$total_domains" "$current" "$domain"
+
+        declare -A resolved_ips
+        resolve_domain "$domain"
+
+        for ip in "${!resolved_ips[@]}"; do
+            if check_blocklist "$ip"; then
+                log "Blocked VPN provider IP: $ip (from $domain)"
+                continue
+            fi
+
+            if [[ -z "${added_ips[$ip]}" ]]; then
+                if ! ip route show table "$MARK" | grep -q "$ip"; then
+                    ip route add "$ip" via "$DEFAULT_WANGW" dev "$DEFAULT_LANIF" table "$MARK" 2>/dev/null && \
+                        log "Added route for $ip to table $MARK"
+                fi
+
+                if ! iptables -t mangle -C PREROUTING -d "$ip" -j MARK --set-mark "$MARK" 2>/dev/null; then
+                    iptables -t mangle -A PREROUTING -d "$ip" -j MARK --set-mark "$MARK" && \
+                        log "Added iptables rule for $ip (mark $MARK)"
+                fi
+
+                added_ips["$ip"]=1
+            fi
+        done
+    done
+
+    echo # Neue Zeile nach Progress-Bar
+
+    # Statusbericht
+    {
+        echo "=== MPVPN2 Split-DNS Status ==="
+        echo "Last Update: $(date)"
+        echo "Routing Table: $MARK (clear)"
+        echo "Gateway: $DEFAULT_WANGW"
+        echo "Interface: $DEFAULT_LANIF"
+        echo "Processed Domains: ${#CLEARDOMAINS[@]}"
+        echo "Unique IPs Routed: ${#added_ips[@]}"
+        echo ""
+        echo "=== Domains ==="
+        printf '%s\n' "${CLEARDOMAINS[@]}"
+        echo ""
+        echo "=== Routed IPs ==="
+        printf '%s\n' "${!added_ips[@]}" | sort
+    } > "$STATUS_FILE"
+
+    log "Successfully updated routing for ${#added_ips[@]} unique IPs"
+}
+
+# === Ausführung ===
+update_routing

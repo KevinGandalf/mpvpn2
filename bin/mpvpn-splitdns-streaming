@@ -1,0 +1,137 @@
+#!/bin/bash
+set -euo pipefail
+
+source /opt/mpvpn2/etc/globals.conf
+
+# === Konfiguration ===
+IP_FILE="/opt/mpvpn2/ips/vpn_bypass_ips.txt"
+IP_FILE_PREVIOUS="/opt/mpvpn2/ips/vpn_bypass_ips_previous.txt"
+LOG_FILE="/opt/mpvpn2/logs/streaming-$(date +%Y%m%d).log"
+TARGET_TABLE_NAME="streaming"
+DEBUG=true
+
+# === Hilfsfunktionen ===
+show_progress() {
+    local current=$1
+    local total=$2
+    local elapsed=$(( $(date +%s) - START_TIME ))
+    local avg=$(( current > 0 ? elapsed / current : 0 ))
+    local remaining=$(( total - current ))
+    local eta=$(( avg * remaining ))
+
+    local width=50
+    local filled=$(( (current * width) / total ))
+    local empty=$(( width - filled ))
+
+    printf "\r["
+    printf '%0.s#' $(seq 1 $filled)
+    printf '%0.s-' $(seq 1 $empty)
+    printf "] %d%% | ETA: %02d:%02d" $(( (current * 100) / total )) $((eta/60)) $((eta%60))
+}
+
+validate_ip() {
+    local ip=$1
+    [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] && return 0 || return 1
+}
+
+# === Routing-Tabelle ermitteln ===
+MARK=""
+for entry in "${EXTRA_RT_TABLES[@]}"; do
+    rt_id="${entry%% *}"
+    rt_name="${entry#* }"
+    [[ "$DEBUG" == true ]] && echo "DEBUG: Checking '$entry' → Name='$rt_name' ID=$rt_id"
+    if [[ "$rt_name" == "$TARGET_TABLE_NAME" ]]; then
+        MARK="$rt_id"
+        break
+    fi
+done
+
+[[ -z "$MARK" ]] && {
+    echo "❌ Routing table '$TARGET_TABLE_NAME' not found!" >&2
+    exit 1
+}
+
+# === Netzwerkparameter prüfen ===
+[[ -z "${DEFAULT_WANGW:-}" || -z "${DEFAULT_LANIF:-}" ]] && {
+    echo "❌ DEFAULT_WANGW or DEFAULT_LANIF is not set!" >&2
+    exit 1
+}
+
+# === IP-Liste herunterladen ===
+echo "$(date +'%Y-%m-%d %H:%M:%S') - Downloading IP list..."
+if ! curl --interface azirevpn1 -s https://lou.h0rst.us/vpn_bypass.txt -o "$IP_FILE"; then
+    echo "❌ Failed to download IP list!" >&2
+    exit 1
+fi
+
+# === IPs verarbeiten ===
+echo "$(date +'%Y-%m-%d %H:%M:%S') - Processing IP addresses..."
+
+# 1. Deduplizierung beim Einlesen
+# 2. Sortierung für bessere Lesbarkeit
+# 3. Gültigkeitsprüfung
+mapfile -t ip_list < <(
+    grep -Eo '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(/[0-9]+)?$' "$IP_FILE" |
+    sort -V |
+    uniq |
+    while read -r ip; do
+        if [[ "$ip" =~ / ]]; then
+            echo "$ip"
+        else
+            echo "$ip/32"
+        fi
+    done
+)
+
+TOTAL_IPS=${#ip_list[@]}
+START_TIME=$(date +%s)
+declare -A processed_ips
+
+# === Routen setzen ===
+for i in "${!ip_list[@]}"; do
+    ip_cidr="${ip_list[$i]}"
+    ip_only="${ip_cidr%%/*}"
+    
+    # Dublettenprüfung
+    if [[ -n "${processed_ips[$ip_cidr]:-}" ]]; then
+        [[ "$DEBUG" == true ]] && echo "⚠️ Duplicate CIDR skipped: $ip_cidr" >&2
+        continue
+    fi
+    processed_ips["$ip_cidr"]=1
+
+    # Gültige IP-Prüfung
+    if ! validate_ip "$ip_only"; then
+        [[ "$DEBUG" == true ]] && echo "⚠️ Invalid IP skipped: $ip_cidr" >&2
+        continue
+    fi
+
+    # Existierende Route prüfen
+    if ip route show table "$MARK" | grep -qwF "$ip_cidr"; then
+        echo "$(date +'%Y-%m-%d %H:%M:%S') - ⚠️ Route exists: $ip_cidr" >> "$LOG_FILE"
+        continue
+    fi
+
+    # Route hinzufügen
+    if ip route add "$ip_cidr" via "$DEFAULT_WANGW" dev "$DEFAULT_LANIF" table "$MARK" 2>> "$LOG_FILE"; then
+        echo "$(date +'%Y-%m-%d %H:%M:%S') - ➕ Added: $ip_cidr" >> "$LOG_FILE"
+    else
+        echo "$(date +'%Y-%m-%d %H:%M:%S') - ❌ Failed: $ip_cidr" >> "$LOG_FILE"
+    fi
+
+    show_progress "$((i+1))" "$TOTAL_IPS"
+done
+
+# === Alte Routen bereinigen ===
+echo -e "\n$(date +'%Y-%m-%d %H:%M:%S') - Cleaning old routes..."
+while read -r old_route; do
+    if [[ ! " ${ip_list[@]} " =~ " $old_route " ]]; then
+        ip route del "$old_route" table "$MARK" 2>> "$LOG_FILE" && \
+        echo "$(date +'%Y-%m-%d %H:%M:%S') - ➖ Removed: $old_route" >> "$LOG_FILE"
+    fi
+done < <(ip route show table "$MARK" | grep -v '^default' | awk '{print $1}')
+
+# === Abschluss ===
+echo "$(date +'%Y-%m-%d %H:%M:%S') - Archiving IP list..."
+mv "$IP_FILE" "$IP_FILE_PREVIOUS"
+
+echo "$(date +'%Y-%m-%d %H:%M:%S') - ✅ Update completed: ${#ip_list[@]} unique IPs processed" | tee -a "$LOG_FILE"

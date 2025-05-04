@@ -1,0 +1,182 @@
+#!/bin/bash
+# MPVPN2 Mirror Routing Script
+# Version 2.0 - Vollständig integriert mit MPVPN2
+
+BASE_PATH="/opt/mpvpn2"
+source "${BASE_PATH}/etc/globals.conf"
+
+# === Verzeichnisstruktur ===
+LOG_DIR="${BASE_PATH}/logs/mirror"
+mkdir -p "$LOG_DIR"
+LOGFILE="${LOG_DIR}/mirror-$(date +%Y%m%d).log"
+STATUS_FILE="${LOG_DIR}/status-$(date +%Y%m%d).log"
+
+# === DNS-Resolver Konfiguration ===
+declare -A DNS_SERVERS=(
+    ["cloudflare"]="1.1.1.1"
+    ["google"]="8.8.8.8"
+    ["quad9"]="9.9.9.9"
+    ["opendns"]="208.67.222.222"
+)
+
+# === Initialisierung ===
+init_mirror_routing() {
+    # Finde mirror-Tabelle
+    MARK=""
+    TABLE=""
+    for entry in "${EXTRA_RT_TABLES[@]}"; do
+        IFS=' ' read -r rt_id rt_name <<< "$entry"
+        if [[ "$rt_name" == "mirror" ]]; then
+            MARK=$rt_id
+            TABLE=$rt_name
+            break
+        fi
+    done
+
+    if [[ -z "$MARK" || -z "$TABLE" ]]; then
+        log "ERROR: 'mirror' table not found in EXTRA_RT_TABLES"
+        exit 1
+    fi
+
+    # Sicherstellen dass Tabelle existiert
+    if ! grep -qE "^$MARK[[:space:]]+$TABLE" /etc/iproute2/rt_tables; then
+        echo "$MARK $TABLE" >> /etc/iproute2/rt_tables
+        log "Added table $MARK ($TABLE) to /etc/iproute2/rt_tables"
+    fi
+
+    # Tabelle leeren
+    if ip route show table "$TABLE" &>/dev/null; then
+        ip route flush table "$TABLE"
+        log "Flushed existing routing table $TABLE"
+    fi
+
+    # Standardroute setzen
+    ip route add default via "$DEFAULT_WANGW" dev "$DEFAULT_LANIF" table "$TABLE"
+    ip rule add fwmark "$MARK" table "$TABLE" 2>/dev/null || log "Rule already exists"
+}
+
+# === Logging ===
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOGFILE"
+}
+
+# === Fortschrittsanzeige ===
+show_progress() {
+    local total=$1
+    local current=$2
+    local domain=$3
+    local width=50
+    local progress=$(( (current * width) / total ))
+    local percent=$(( (current * 100) / total ))
+
+    printf "\r[%-${width}s] %d%% | %s" \
+        "$(printf '#%.0s' $(seq 1 $progress))" \
+        "$percent" \
+        "$domain"
+}
+
+# === DNS-Auflösung ===
+resolve_mirror_domains() {
+    local domain=$1
+    declare -gA resolved_ips
+    declare -A unique_ips
+
+    for dns in "${DNS_SERVERS[@]}"; do
+        while IFS= read -r ip; do
+            [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || continue
+            unique_ips["$ip"]=1
+        done < <(dig +short A "$domain" @"$dns" 2>/dev/null)
+    done
+
+    resolved_ips=()
+    for ip in "${!unique_ips[@]}"; do
+        resolved_ips["$ip"]=1
+    done
+}
+
+# === VPN-Provider Blocklist ===
+check_blocklist() {
+    local ip=$1
+    # Liste bekannter VPN-Provider IPs
+    local vpn_providers=(
+        "nordvpn.com" "expressvpn.com" "surfshark.com"
+        "privateinternetaccess.com" "protonvpn.com"
+    )
+
+    for provider in "${vpn_providers[@]}"; do
+        for dns in "${DNS_SERVERS[@]}"; do
+            if dig +short A "$provider" @"$dns" | grep -q "$ip"; then
+                return 0 # Gefunden in Blocklist
+            fi
+        done
+    done
+
+    return 1 # Nicht blockiert
+}
+
+# === Hauptfunktion ===
+update_mirror_routing() {
+    log "==== Starting Mirror Routing Update ===="
+    init_mirror_routing
+
+    declare -A added_ips
+    local total_domains=${#MIRRORDOMAINS[@]}
+    local current=0
+
+    log "Configuring routing for $total_domains mirror domains"
+
+    for domain in "${MIRRORDOMAINS[@]}"; do
+        ((current++))
+        show_progress "$total_domains" "$current" "$domain"
+
+        declare -A resolved_ips
+        resolve_mirror_domains "$domain"
+
+        for ip in "${!resolved_ips[@]}"; do
+            if check_blocklist "$ip"; then
+                log "Blocked VPN provider IP: $ip (from $domain)"
+                continue
+            fi
+
+            if [[ -z "${added_ips[$ip]}" ]]; then
+                # Route hinzufügen
+                if ! ip route show table "$TABLE" | grep -q "$ip"; then
+                    ip route add "$ip" via "$DEFAULT_WANGW" dev "$DEFAULT_LANIF" table "$TABLE" && \
+                        log "Added route for $ip to table $TABLE"
+                fi
+
+                # iptables Regel
+                if ! iptables -t mangle -C PREROUTING -d "$ip" -j MARK --set-mark "$MARK" 2>/dev/null; then
+                    iptables -t mangle -A PREROUTING -d "$ip" -j MARK --set-mark "$MARK" && \
+                        log "Added iptables rule for $ip (mark $MARK)"
+                fi
+
+                added_ips["$ip"]=1
+            fi
+        done
+    done
+
+    echo # Neue Zeile nach Progress-Bar
+
+    # Statusbericht
+    {
+        echo "=== MPVPN2 Mirror Routing Status ==="
+        echo "Last Update: $(date)"
+        echo "Routing Table: $MARK ($TABLE)"
+        echo "Gateway: $DEFAULT_WANGW"
+        echo "Interface: $DEFAULT_LANIF"
+        echo "Processed Domains: $total_domains"
+        echo "Unique Mirror IPs: ${#added_ips[@]}"
+        echo ""
+        echo "=== Mirror Domains ==="
+        printf '%s\n' "${MIRRORDOMAINS[@]}"
+        echo ""
+        echo "=== Routed Mirror IPs ==="
+        printf '%s\n' "${!added_ips[@]}" | sort
+    } > "$STATUS_FILE"
+
+    log "Successfully updated mirror routing for ${#added_ips[@]} unique IPs"
+}
+
+# === Ausführung ===
+update_mirror_routing
